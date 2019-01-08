@@ -39,46 +39,90 @@ package org.jooq.mcve.test;
 
 import static org.jooq.mcve.Tables.TEST;
 import static org.junit.Assert.assertEquals;
-
 import java.sql.Connection;
 import java.sql.DriverManager;
-
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import org.jooq.DSLContext;
 import org.jooq.impl.DSL;
-import org.jooq.mcve.tables.records.TestRecord;
-
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 public class MCVETest {
 
-    Connection connection;
-    DSLContext ctx;
+    // Oracle IN limit is max 65535 inclusive
+    private static final int ORACLE_IN_LIMIT = 65_535;
+    private static final int EXPECTED_ROWS = ORACLE_IN_LIMIT + 64;
+    private static final List<Integer> IDS = IntStream.range(0, EXPECTED_ROWS).boxed()
+            .collect(Collectors.toList());
 
-    @Before
-    public void setup() throws Exception {
-        connection = DriverManager.getConnection("jdbc:h2:~/mcve", "sa", "");
-        ctx = DSL.using(connection);
+    private static boolean USE_ORACLE = true;
+    private static Connection connection;
+    private DSLContext ctx;
+
+    @BeforeClass
+    public static void beforeClass() throws Exception {
+        if (USE_ORACLE) {
+            // test example using Oracle XE https://hub.docker.com/r/sath89/oracle-12c/
+            String url = "jdbc:oracle:thin:@localhost:1521:xe";
+            connection = DriverManager.getConnection(url, "system", "oracle");
+        } else {
+            connection = DriverManager.getConnection("jdbc:h2:~/mcve", "sa", "");
+        }
+
+        setupTable(DSL.using(connection));
     }
 
-    @After
-    public void after() throws Exception {
-        ctx = null;
+    private static void setupTable(DSLContext ctx) {
+        int count = ctx.select(DSL.count())
+                .from(TEST)
+                .fetchOne(0, int.class);
+        if (count != EXPECTED_ROWS) {
+            ctx.truncate(TEST).cascade().execute();
+            batchInsert(ctx, EXPECTED_ROWS);
+        }
+    }
+
+    @AfterClass
+    public static void afterClass() throws Exception {
         connection.close();
         connection = null;
     }
 
-    @Test
-    public void mcveTest() {
-        TestRecord result =
-        ctx.insertInto(TEST)
-           .columns(TEST.VALUE)
-           .values(42)
-           .returning(TEST.ID)
-           .fetchOne();
+    @Before
+    public void setup() {
+        ctx = DSL.using(connection);
+    }
 
-        result.refresh();
-        assertEquals(42, (int) result.getValue());
+    @After
+    public void after() {
+        ctx = null;
+    }
+
+    @Test
+    public void whereIn() {
+        // the following WHERE IN fails on Oracle with ORA-01745: invalid host/bind variable name
+        // when more than 65535 ids are provided
+        int count = ctx.select(DSL.count()).from(TEST)
+                .where(TEST.ID.in(IDS))
+                .fetchOne(0, int.class);
+        System.out.println(count);
+        assertEquals(EXPECTED_ROWS, count);
+    }
+
+    private static void batchInsert(DSLContext ctx, int expectedRows) {
+        int[] execute = ctx.batch(
+                IntStream.range(0, expectedRows).mapToObj(i ->
+                        ctx.insertInto(TEST)
+                                .columns(TEST.ID, TEST.VALUE)
+                                .values(i, i))
+                        .collect(Collectors.toList())
+        ).execute();
+        int inserted = IntStream.of(execute).sum();
+        assertEquals(expectedRows, inserted);
     }
 }
